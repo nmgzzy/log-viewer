@@ -97,6 +97,29 @@ impl LogViewerApp {
             last_tab_count: 0,
         };
         app.restore_session();
+        // 命令行参数：logviewer [--udp 端口] <文件/目录>...
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            if arg == "--udp" {
+                if let Some(port) = args.next().and_then(|s| s.parse::<u16>().ok()) {
+                    let archive = Some(ArchiveConfig {
+                        dir: default_archive_dir(),
+                        prefix: format!("udp-{port}"),
+                        ..Default::default()
+                    });
+                    let _ = app.start_udp("0.0.0.0".into(), port, archive);
+                }
+                continue;
+            }
+            let p = PathBuf::from(&arg);
+            if p.exists() {
+                let title = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or(arg);
+                app.open_file_tab(vec![p], title);
+            }
+        }
         app
     }
 
