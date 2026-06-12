@@ -121,6 +121,7 @@ pub struct Tab {
     actions: Vec<Action>,
     rate_samples: VecDeque<(Instant, u64)>,
     pub rate: f64,
+    pub dash: crate::dashboard::DashState,
 }
 
 impl Tab {
@@ -166,6 +167,7 @@ impl Tab {
             actions: Vec::new(),
             rate_samples: VecDeque::new(),
             rate: 0.0,
+            dash: crate::dashboard::DashState::default(),
         }
     }
 
@@ -282,6 +284,9 @@ impl Tab {
 
     pub fn ui(&mut self, ui: &mut egui::Ui, t: &Texts, dark: bool) {
         self.toolbar(ui, t);
+        if self.show_dashboard {
+            crate::dashboard::dashboard_ui(self, ui, t);
+        }
         if self.show_filter {
             self.filter_panel(ui, t);
         }

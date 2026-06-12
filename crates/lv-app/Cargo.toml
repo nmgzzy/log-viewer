@@ -18,7 +18,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 eframe = "0.34.3"
 egui_extras = "0.34.3"
-egui_plot = "0.34"
+egui_plot = "0.35"
 rfd = "0.17.2"
 dirs = "6"
 

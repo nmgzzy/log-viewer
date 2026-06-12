@@ -15,6 +15,7 @@ pub mod model;
 pub mod parse;
 pub mod search;
 pub mod source;
+pub mod stats;
 pub mod store;
 pub mod symbols;
 pub mod view;

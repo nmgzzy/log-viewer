@@ -15,6 +15,7 @@ use lv_core::source::udp::{spawn as spawn_udp, UdpSourceConfig};
 
 use crate::fonts::install_cjk_fonts;
 use crate::i18n::{texts, Lang, Texts};
+use crate::session::{self, Session, SessionKind, SessionTab};
 use crate::tab::{Tab, TabKind};
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -75,12 +76,14 @@ pub struct LogViewerApp {
     about_open: bool,
     filter_name_input: String,
     visuals_applied: bool,
+    last_session_save: std::time::Instant,
+    last_tab_count: usize,
 }
 
 impl LogViewerApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         install_cjk_fonts(&cc.egui_ctx);
-        Self {
+        let mut app = Self {
             settings: Settings::default(),
             tabs: Vec::new(),
             active: 0,
@@ -90,7 +93,91 @@ impl LogViewerApp {
             about_open: false,
             filter_name_input: String::new(),
             visuals_applied: false,
+            last_session_save: std::time::Instant::now(),
+            last_tab_count: 0,
+        };
+        app.restore_session();
+        app
+    }
+
+    // ---------- 会话持久化 ----------
+
+    fn restore_session(&mut self) {
+        let Some(sess) = session::load() else { return };
+        self.settings = sess.settings;
+        for st in sess.tabs {
+            let created = match &st.kind {
+                Some(SessionKind::File { paths }) => {
+                    let before = self.tabs.len();
+                    self.open_file_tab(paths.clone(), st.title.clone());
+                    self.tabs.len() > before
+                }
+                Some(SessionKind::Udp { bind, port, archive }) => self
+                    .start_udp(bind.clone(), *port, archive.clone())
+                    .is_ok(),
+                None => false,
+            };
+            if created {
+                if let Some(tab) = self.tabs.last_mut() {
+                    tab.filter = st.filter;
+                    tab.rules = st.rules;
+                    tab.cols = st.cols;
+                    tab.compact = st.compact;
+                    tab.wrap = st.wrap;
+                    tab.time_mode = st.time_mode;
+                    tab.show_filter = st.show_filter;
+                    tab.show_dashboard = st.show_dashboard;
+                    tab.filter_dirty = true;
+                    tab.hl_dirty = true;
+                }
+            }
         }
+        self.active = sess.active.min(self.tabs.len().saturating_sub(1));
+    }
+
+    fn save_session(&self) {
+        let tabs: Vec<SessionTab> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                let kind = match &tab.kind {
+                    TabKind::File { paths } => Some(SessionKind::File {
+                        paths: paths.clone(),
+                    }),
+                    TabKind::Udp {
+                        bind,
+                        port,
+                        archive,
+                    } => Some(SessionKind::Udp {
+                        bind: bind.clone(),
+                        port: *port,
+                        archive: archive.clone(),
+                    }),
+                    TabKind::Merged { .. } => None, // 合并 Tab 不恢复
+                };
+                kind.map(|kind| SessionTab {
+                    kind: Some(kind),
+                    title: tab.title.clone(),
+                    filter: tab.filter.clone(),
+                    rules: tab.rules.clone(),
+                    cols: tab.cols,
+                    compact: tab.compact,
+                    wrap: tab.wrap,
+                    time_mode: tab.time_mode,
+                    show_filter: tab.show_filter,
+                    show_dashboard: tab.show_dashboard,
+                })
+            })
+            .collect();
+        session::save(&Session {
+            settings: Settings {
+                lang: self.settings.lang,
+                dark: self.settings.dark,
+                saved_filters: self.settings.saved_filters.clone(),
+            },
+            tabs,
+            active: self.active,
+        });
     }
 
     fn next_id(&mut self) -> u64 {
@@ -140,12 +227,6 @@ impl LogViewerApp {
             .trim()
             .parse()
             .map_err(|_| "端口无效 / bad port".to_string())?;
-        let cfg = UdpSourceConfig {
-            bind: d.bind.trim().to_owned(),
-            port,
-        };
-        let (handle, local) = spawn_udp(cfg).map_err(|e| e.to_string())?;
-        let title = format!("udp:{local}");
         let archive = d.archive_on.then(|| ArchiveConfig {
             dir: PathBuf::from(d.dir.trim()),
             prefix: format!("udp-{port}"),
@@ -156,12 +237,27 @@ impl LogViewerApp {
             },
             ..Default::default()
         });
+        self.start_udp(d.bind.trim().to_owned(), port, archive)
+    }
+
+    fn start_udp(
+        &mut self,
+        bind: String,
+        port: u16,
+        archive: Option<ArchiveConfig>,
+    ) -> Result<(), String> {
+        let cfg = UdpSourceConfig {
+            bind: bind.clone(),
+            port,
+        };
+        let (handle, local) = spawn_udp(cfg).map_err(|e| e.to_string())?;
+        let title = format!("udp:{local}");
         let id = self.next_id();
         let mut tab = Tab::new(
             id,
             title.clone(),
             TabKind::Udp {
-                bind: d.bind.clone(),
+                bind,
                 port,
                 archive: archive.clone(),
             },
@@ -627,6 +723,15 @@ impl eframe::App for LogViewerApp {
             .any(|tb| (tb.live && tb.ingest.is_some()) || tb.is_loading());
         if busy {
             ctx.request_repaint_after(Duration::from_millis(150));
+        }
+
+        // 会话持久化：关闭时 + 标签页变化时 + 周期兜底
+        let closing = ctx.input(|i| i.viewport().close_requested());
+        let tabs_changed = self.last_tab_count != self.tabs.len();
+        if closing || tabs_changed || self.last_session_save.elapsed().as_secs() >= 30 {
+            self.save_session();
+            self.last_session_save = std::time::Instant::now();
+            self.last_tab_count = self.tabs.len();
         }
     }
 }

@@ -1,9 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod dashboard;
 mod fmt;
 mod fonts;
 mod i18n;
+mod session;
 mod tab;
 
 fn main() -> eframe::Result<()> {
