@@ -6,9 +6,11 @@
 
 pub mod arena;
 pub mod model;
+pub mod parse;
 pub mod store;
 pub mod symbols;
 
 pub use model::{ParsedLine, RecordMeta, SpanRef, LEVEL_NAMES, PID_NONE};
+pub use parse::{parse_auto, FieldMap, ParserCtx};
 pub use store::{LogStore, RetainLimits};
 pub use symbols::SymbolTable;

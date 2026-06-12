@@ -74,9 +74,8 @@ pub struct RecordMeta {
     pub flags: u8,
     /// 原始行。
     pub raw: SpanRef,
-    /// msg 在 raw 内的字节偏移与长度。
-    pub msg_off: u32,
-    pub msg_len: u32,
+    /// msg 正文。通常指向 raw 内的子区间；JSON 行解码后的 msg 是独立追加的串。
+    pub msg: SpanRef,
 }
 
 impl RecordMeta {
@@ -102,6 +101,9 @@ pub struct ParsedLine<'a> {
     pub facility: u8,
     /// msg 在原始行内的字节区间 [start, end)。
     pub msg_range: (usize, usize),
+    /// 当 msg 不是 raw 的子串时（JSON 转义解码），存放解码后的正文；
+    /// 存储时优先于 msg_range。
+    pub msg_owned: Option<String>,
     /// 是否解析成功；false 时整行按 raw 展示并标记"未解析"。
     pub parsed: bool,
 }
@@ -119,6 +121,7 @@ impl<'a> ParsedLine<'a> {
             level: 6,
             facility: 1,
             msg_range: (0, raw.len()),
+            msg_owned: None,
             parsed: false,
         }
     }

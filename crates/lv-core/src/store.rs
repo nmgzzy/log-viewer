@@ -132,10 +132,7 @@ impl LogStore {
     }
 
     pub fn msg_text(&self, m: &RecordMeta) -> &str {
-        let raw = self.raw_text(m);
-        let start = m.msg_off as usize;
-        let end = start + m.msg_len as usize;
-        raw.get(start..end).unwrap_or(raw)
+        self.arena.get(m.msg).unwrap_or("<已淘汰>")
     }
 
     pub fn arena_bytes(&self) -> u64 {
@@ -150,6 +147,17 @@ impl LogStore {
         fallback_ts_us: i64,
     ) -> RecordMeta {
         let span: SpanRef = self.arena.push(raw);
+        let msg: SpanRef = match &p.msg_owned {
+            Some(owned) => self.arena.push(owned),
+            None => {
+                let start = p.msg_range.0.min(raw.len());
+                let end = p.msg_range.1.clamp(start, raw.len());
+                SpanRef {
+                    offset: span.offset + start as u64,
+                    len: (end - start) as u32,
+                }
+            }
+        };
         let (ts, mut fl) = match p.ts {
             Some(t) => (t, 0u8),
             None => (fallback_ts_us, flags::TS_SYNTHETIC),
@@ -157,7 +165,6 @@ impl LogStore {
         if p.parsed {
             fl |= flags::PARSED;
         }
-        let (msg_start, msg_end) = p.msg_range;
         RecordMeta {
             ts,
             tz_offset_min: p.tz_offset_min,
@@ -170,9 +177,7 @@ impl LogStore {
             facility: p.facility,
             flags: fl,
             raw: span,
-            msg_off: msg_start.min(raw.len()) as u32,
-            msg_len: msg_end.saturating_sub(msg_start).min(raw.len() - msg_start.min(raw.len()))
-                as u32,
+            msg,
         }
     }
 
@@ -328,6 +333,7 @@ mod tests {
             level: 6,
             facility: 16,
             msg_range,
+            msg_owned: None,
             parsed: true,
         }
     }
