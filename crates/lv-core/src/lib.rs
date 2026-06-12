@@ -17,6 +17,7 @@ pub mod search;
 pub mod source;
 pub mod store;
 pub mod symbols;
+pub mod view;
 
 pub use model::{ParsedLine, RecordMeta, SpanRef, LEVEL_NAMES, PID_NONE};
 pub use parse::{parse_auto, FieldMap, ParserCtx};

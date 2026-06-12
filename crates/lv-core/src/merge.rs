@@ -35,8 +35,8 @@ pub fn merge_snapshot(target: &mut LogStore, inputs: &[MergeInput], ctx: &Parser
         let Some(m) = src.meta_at(idx) else { continue };
         let raw = src.raw_text(m);
         let p = parse_auto(raw, ctx);
-        // 源内部可能有局部乱序，用 append_sorted 自愈
-        target.append_sorted(raw, &p, src_ids[k], m.ts);
+        // 堆序保证目标按 ts 追加；显示层 TabView 再兜底窗口重排
+        target.append(raw, &p, src_ids[k], m.ts);
         merged += 1;
         if let Some(next) = src.meta_at(idx + 1) {
             heap.push(Reverse((next.ts, k, idx + 1)));

@@ -222,34 +222,6 @@ impl LogStore {
         self.next_seq() - 1
     }
 
-    /// 按 ts 在尾部窗口内回插（用于合并时间线 / 乱序网络流）。
-    /// 返回插入位置的下标（注意：之后的行下标会变，调用方应在批后重建视图尾部）。
-    pub fn append_sorted(
-        &mut self,
-        raw: &str,
-        p: &ParsedLine,
-        source: u16,
-        fallback_ts_us: i64,
-    ) -> usize {
-        let m = self.build_meta(raw, p, source, fallback_ts_us);
-        self.count_in(&m);
-        let len = self.meta.len();
-        let window_start = len.saturating_sub(REORDER_WINDOW);
-        // 在 [window_start, len) 内找第一个 ts > m.ts 的位置（稳定：相同 ts 排后）
-        let mut lo = window_start;
-        let mut hi = len;
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if self.meta[mid].ts <= m.ts {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        self.meta.insert(lo, m);
-        lo
-    }
-
     /// 应用保留策略，返回本次淘汰的行数。
     pub fn enforce_limits(&mut self) -> usize {
         let mut evicted = 0usize;
@@ -288,17 +260,12 @@ impl LogStore {
         self.unparsed_count = 0;
     }
 
-    /// 计算前部窗口内最小存活 raw 偏移，淘汰其之前的整块。
-    /// （append_sorted 只在尾部窗口乱序，但保险起见对前部窗口取最小值。）
+    /// 追加为唯一写入路径，meta 顺序即 arena 顺序：按存活首行偏移淘汰前缀块。
     fn evict_arena_prefix(&mut self) {
-        let probe = self.meta.len().min(REORDER_WINDOW);
-        let mut min_off = u64::MAX;
-        for i in 0..probe {
-            min_off = min_off.min(self.meta[i].raw.offset);
-        }
-        if probe == 0 {
-            min_off = self.arena.next_offset();
-        }
+        let min_off = match self.meta.front() {
+            Some(m) => m.raw.offset,
+            None => self.arena.next_offset(),
+        };
         self.arena.evict_before(min_off);
     }
 
@@ -419,35 +386,6 @@ mod tests {
         // 尾部行完好
         let last = *s.meta_at(s.len() - 1).unwrap();
         assert!(s.raw_text(&last).ends_with("999"));
-    }
-
-    #[test]
-    fn append_sorted_reorders_within_window() {
-        let mut s = LogStore::new();
-        let src = s.add_source("udp:test");
-        let ts_list = [100i64, 300, 200, 500, 400, 50];
-        for (i, ts) in ts_list.iter().enumerate() {
-            let raw = format!("m{i}");
-            let p = parsed((0, raw.len()), *ts);
-            s.append_sorted(&raw, &p, src, 0);
-        }
-        let got: Vec<i64> = (0..s.len()).map(|i| s.meta_at(i).unwrap().ts).collect();
-        assert_eq!(got, vec![50, 100, 200, 300, 400, 500]);
-    }
-
-    #[test]
-    fn append_sorted_is_stable_for_equal_ts() {
-        let mut s = LogStore::new();
-        let src = s.add_source("udp:test");
-        for i in 0..5 {
-            let raw = format!("same{i}");
-            let p = parsed((0, raw.len()), 100);
-            s.append_sorted(&raw, &p, src, 0);
-        }
-        for i in 0..5 {
-            let m = *s.meta_at(i).unwrap();
-            assert_eq!(s.raw_text(&m), format!("same{i}"));
-        }
     }
 
     #[test]

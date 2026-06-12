@@ -17,8 +17,10 @@ use crate::store::LogStore;
 
 pub struct IngestOpts {
     pub source_id: u16,
-    /// true：按 ts 回插（UDP/合并流乱序重排，FR-8）；false：顺序追加（文件）。
-    pub sorted: bool,
+    /// true：实时流（UDP/合并），无内容时间戳的行回退到接收时间；
+    /// false：文件，回退到邻行时间戳保持文件顺序。
+    /// 显示层的乱序重排由 `view::TabView::sort_by_ts` 负责。
+    pub live: bool,
     pub ctx: ParserCtx,
     /// UDP 自动落盘归档（FR-3）。
     pub archive: Option<ArchiveConfig>,
@@ -177,16 +179,12 @@ fn ingest_batch(
             }
         }
         // 无内容时间戳的回退：文件按邻行保持顺序，网络按接收时间
-        let fallback = if opts.sorted || last_ts == 0 {
+        let fallback = if opts.live || last_ts == 0 {
             line.recv_ts_us
         } else {
             last_ts
         };
-        if opts.sorted {
-            s.append_sorted(&line.text, &p, opts.source_id, fallback);
-        } else {
-            s.append(&line.text, &p, opts.source_id, fallback);
-        }
+        s.append(&line.text, &p, opts.source_id, fallback);
         if let Some(m) = s.meta_at(s.len() - 1) {
             last_ts = last_ts.max(m.ts);
         }
@@ -210,10 +208,10 @@ mod tests {
     use super::*;
     use crate::archive::ArchiveSplit;
 
-    fn opts(source_id: u16, sorted: bool) -> IngestOpts {
+    fn opts(source_id: u16, live: bool) -> IngestOpts {
         IngestOpts {
             source_id,
-            sorted,
+            live,
             ctx: ParserCtx::default(),
             archive: None,
             paused: Arc::new(AtomicBool::new(false)),
@@ -275,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn sorted_mode_reorders_and_archives() {
+    fn live_mode_appends_in_arrival_order_and_archives() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(LogStore::new()));
         let src = store.lock().unwrap().add_source("udp");
@@ -298,10 +296,11 @@ mod tests {
         drop(tx);
         h.join();
         let s = store.lock().unwrap();
+        // 存储保持到达顺序（seq 即身份）；显示层 TabView 负责按 ts 重排
         let msgs: Vec<String> = (0..s.len())
             .map(|i| s.msg_text(s.meta_at(i).unwrap()).to_owned())
             .collect();
-        assert_eq!(msgs, vec!["first", "second", "third"]);
+        assert_eq!(msgs, vec!["second", "first", "third"]);
         // 归档按到达顺序原样保留
         let content = std::fs::read_to_string(dir.path().join("udp-all.log")).unwrap();
         let archived: Vec<&str> = content.lines().collect();
