@@ -6,9 +6,14 @@
 
 pub mod arena;
 pub mod archive;
+pub mod export;
+pub mod filter;
+pub mod highlight;
 pub mod ingest;
+pub mod merge;
 pub mod model;
 pub mod parse;
+pub mod search;
 pub mod source;
 pub mod store;
 pub mod symbols;
