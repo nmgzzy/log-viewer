@@ -5,8 +5,11 @@
 //! 归档 / 导出。UI 层（lv-app）只依赖本库的公开接口。
 
 pub mod arena;
+pub mod archive;
+pub mod ingest;
 pub mod model;
 pub mod parse;
+pub mod source;
 pub mod store;
 pub mod symbols;
 
