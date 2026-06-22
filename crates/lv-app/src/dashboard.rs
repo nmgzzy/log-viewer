@@ -43,6 +43,9 @@ pub fn dashboard_ui(tab: &mut Tab, ui: &mut egui::Ui, t: &Texts) {
         tab.dash.stats.clone()
     };
 
+    // 统计始终基于全量 store，与表格的过滤视图无关 —— 明示避免误解
+    ui.label(RichText::new(t.dash_scope_all).weak().small());
+
     ui.horizontal(|ui| {
         // 左：堆叠柱状图
         let plot_w = (ui.available_width() * 0.6).max(280.0);

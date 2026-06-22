@@ -1,6 +1,6 @@
 //! 合并时间线（FR-8）：把多个源 store 的现有内容按 `ts` k 路归并进目标
-//! store；每行 source 标注沿用各自来源名。live 增量由 ingest 的 taps +
-//! `append_sorted`（时间窗重排）承担。
+//! store；每行 source 标注沿用各自来源名。live 增量由 ingest 的 taps 转发，
+//! 时间窗重排由显示层 `view::TabView::sort_by_ts` 承担（存储仍 append-only）。
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;

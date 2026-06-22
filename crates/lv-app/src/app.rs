@@ -12,18 +12,31 @@ use lv_core::merge::{merge_snapshot, MergeInput};
 use lv_core::parse::ParserCtx;
 use lv_core::source::file::{expand_and_order, is_gz, spawn as spawn_file, FileSourceConfig};
 use lv_core::source::udp::{spawn as spawn_udp, UdpSourceConfig};
+use lv_core::store::RetainLimits;
 
+use crate::fmt::TimeMode;
 use crate::fonts::install_cjk_fonts;
 use crate::i18n::{texts, Lang, Texts};
 use crate::session::{self, Session, SessionKind, SessionTab};
-use crate::tab::{Tab, TabKind};
+use crate::tab::{ColumnsVisible, Tab, TabKind};
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 #[serde(default)]
 pub struct Settings {
     pub lang: Lang,
     pub dark: bool,
     pub saved_filters: Vec<SavedFilter>,
+    /// 默认归档目录（UDP 对话框与 `--udp` 的初值）。
+    pub archive_dir: String,
+    /// 新建标签页的默认显示项。
+    pub default_time_mode: TimeMode,
+    pub default_compact: bool,
+    pub default_wrap: bool,
+    pub default_cols: ColumnsVisible,
+    pub dash_threshold: f64,
+    /// 环形保留上限（R2/§8）：行数与原始文本内存（MB）。
+    pub retain_max_rows: usize,
+    pub retain_max_mb: u64,
 }
 
 impl Default for Settings {
@@ -32,6 +45,24 @@ impl Default for Settings {
             lang: Lang::default(),
             dark: true,
             saved_filters: Vec::new(),
+            archive_dir: default_archive_dir().display().to_string(),
+            default_time_mode: TimeMode::default(),
+            default_compact: true,
+            default_wrap: false,
+            default_cols: ColumnsVisible::default(),
+            dash_threshold: 10.0,
+            retain_max_rows: 1_200_000,
+            retain_max_mb: 768,
+        }
+    }
+}
+
+impl Settings {
+    /// 由用户可调上限折算成 store 的保留策略。
+    fn retain_limits(&self) -> RetainLimits {
+        RetainLimits {
+            max_rows: self.retain_max_rows.max(1),
+            max_bytes: self.retain_max_mb.saturating_mul(1 << 20).max(1),
         }
     }
 }
@@ -74,6 +105,7 @@ pub struct LogViewerApp {
     udp_dialog: Option<UdpDialog>,
     merge_dialog: Option<Vec<bool>>,
     about_open: bool,
+    settings_open: bool,
     filter_name_input: String,
     visuals_applied: bool,
     last_session_save: std::time::Instant,
@@ -91,6 +123,7 @@ impl LogViewerApp {
             udp_dialog: None,
             merge_dialog: None,
             about_open: false,
+            settings_open: false,
             filter_name_input: String::new(),
             visuals_applied: false,
             last_session_save: std::time::Instant::now(),
@@ -103,7 +136,7 @@ impl LogViewerApp {
             if arg == "--udp" {
                 if let Some(port) = args.next().and_then(|s| s.parse::<u16>().ok()) {
                     let archive = Some(ArchiveConfig {
-                        dir: default_archive_dir(),
+                        dir: PathBuf::from(app.settings.archive_dir.trim()),
                         prefix: format!("udp-{port}"),
                         ..Default::default()
                     });
@@ -176,7 +209,7 @@ impl LogViewerApp {
                         port: *port,
                         archive: archive.clone(),
                     }),
-                    TabKind::Merged { .. } => None, // 合并 Tab 不恢复
+                    TabKind::Merged => None, // 合并 Tab 不恢复
                 };
                 kind.map(|kind| SessionTab {
                     kind: Some(kind),
@@ -193,11 +226,7 @@ impl LogViewerApp {
             })
             .collect();
         session::save(&Session {
-            settings: Settings {
-                lang: self.settings.lang,
-                dark: self.settings.dark,
-                saved_filters: self.settings.saved_filters.clone(),
-            },
+            settings: self.settings.clone(),
             tabs,
             active: self.active,
         });
@@ -206,6 +235,18 @@ impl LogViewerApp {
     fn next_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
+    }
+
+    /// 用全局设置初始化新建标签页的显示默认值与保留上限。
+    fn apply_tab_defaults(&self, tab: &mut Tab) {
+        tab.time_mode = self.settings.default_time_mode;
+        tab.compact = self.settings.default_compact;
+        tab.wrap = self.settings.default_wrap;
+        tab.cols = self.settings.default_cols;
+        tab.dash_threshold = self.settings.dash_threshold;
+        if let Ok(mut store) = tab.store.lock() {
+            store.limits = self.settings.retain_limits();
+        }
     }
 
     // ---------- Tab 创建 ----------
@@ -217,6 +258,7 @@ impl LogViewerApp {
         }
         let id = self.next_id();
         let mut tab = Tab::new(id, title.clone(), TabKind::File { paths: files.clone() }, false);
+        self.apply_tab_defaults(&mut tab);
         let follow = files.last().map(|p| !is_gz(p)).unwrap_or(false);
         let handle = spawn_file(FileSourceConfig {
             paths: files,
@@ -273,7 +315,8 @@ impl LogViewerApp {
             bind: bind.clone(),
             port,
         };
-        let (handle, local) = spawn_udp(cfg).map_err(|e| e.to_string())?;
+        let (handle, local) =
+            spawn_udp(cfg).map_err(|e| format!("绑定失败 / bind failed: {e}"))?;
         let title = format!("udp:{local}");
         let id = self.next_id();
         let mut tab = Tab::new(
@@ -286,6 +329,7 @@ impl LogViewerApp {
             },
             true,
         );
+        self.apply_tab_defaults(&mut tab);
         let source_id = tab.store.lock().unwrap().add_source(title);
         let ingest = spawn_ingest(
             handle.rx.clone(),
@@ -315,14 +359,8 @@ impl LogViewerApp {
             .map(|&i| self.tabs[i].title.clone())
             .collect();
         let title = format!("{} ({})", t.merged_tab_name, titles.join("+"));
-        let mut tab = Tab::new(
-            id,
-            title,
-            TabKind::Merged {
-                members: titles.clone(),
-            },
-            true,
-        );
+        let mut tab = Tab::new(id, title, TabKind::Merged, true);
+        self.apply_tab_defaults(&mut tab);
         // 1) 快照合并现有内容
         {
             let guards: Vec<_> = member_idx
@@ -381,7 +419,7 @@ impl LogViewerApp {
 
     fn top_bar(&mut self, root: &mut egui::Ui) {
         let t = texts(self.settings.lang);
-        egui::TopBottomPanel::top("top").show_inside(root, |ui| {
+        egui::Panel::top("top").show_inside(root, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.menu_button(t.menu_file, |ui| {
                     if ui.button(t.open_files).clicked() {
@@ -394,7 +432,10 @@ impl LogViewerApp {
                     }
                     if ui.button(t.open_udp).clicked() {
                         ui.close();
-                        self.udp_dialog = Some(UdpDialog::default());
+                        self.udp_dialog = Some(UdpDialog {
+                            dir: self.settings.archive_dir.clone(),
+                            ..UdpDialog::default()
+                        });
                     }
                     ui.separator();
                     if ui.button(t.merge_tabs).clicked() {
@@ -402,21 +443,8 @@ impl LogViewerApp {
                         self.merge_dialog = Some(vec![false; self.tabs.len()]);
                     }
                 });
-                ui.menu_button(t.menu_view, |ui| {
-                    if ui.radio(self.settings.dark, t.theme_dark).clicked() {
-                        self.settings.dark = true;
-                        self.visuals_applied = false;
-                    }
-                    if ui.radio(!self.settings.dark, t.theme_light).clicked() {
-                        self.settings.dark = false;
-                        self.visuals_applied = false;
-                    }
-                });
-                if ui.button(t.language).clicked() {
-                    self.settings.lang = match self.settings.lang {
-                        Lang::Zh => Lang::En,
-                        Lang::En => Lang::Zh,
-                    };
+                if ui.button(format!("⚙ {}", t.settings)).clicked() {
+                    self.settings_open = true;
                 }
                 // 已存过滤器（应用到当前 Tab）
                 if !self.tabs.is_empty() {
@@ -537,7 +565,7 @@ impl LogViewerApp {
 
     fn tab_bar(&mut self, root: &mut egui::Ui) {
         let t = texts(self.settings.lang);
-        egui::TopBottomPanel::top("tabs").show_inside(root, |ui| {
+        egui::Panel::top("tabs").show_inside(root, |ui| {
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let mut close: Option<usize> = None;
@@ -606,7 +634,7 @@ impl LogViewerApp {
                         }
                     });
                     if let Some(e) = &d.error {
-                        ui.colored_label(Color32::RED, format!("{}: {e}", t.udp_err_bind));
+                        ui.colored_label(Color32::RED, e);
                     }
                     ui.horizontal(|ui| {
                         if ui.button(t.udp_start).clicked() {
@@ -649,7 +677,7 @@ impl LogViewerApp {
                 .show(ctx, |ui| {
                     ui.label(t.merge_pick_hint);
                     for (i, tab) in self.tabs.iter().enumerate() {
-                        if matches!(tab.kind, TabKind::Merged { .. }) {
+                        if matches!(tab.kind, TabKind::Merged) {
                             continue;
                         }
                         ui.checkbox(&mut sel[i], &tab.title);
@@ -685,6 +713,151 @@ impl LogViewerApp {
                     ui.label("uf_log syslog viewer · RFC5424 / RFC3164 / JSON");
                 });
             self.about_open = open;
+        }
+        // 设置页（FR：常用设置集中）
+        if self.settings_open {
+            let mut open = self.settings_open;
+            let mut theme_changed = false;
+            let mut pick_dir = false;
+            let tm_label = |m: TimeMode| match m {
+                TimeMode::AbsOriginal => t.time_abs_orig,
+                TimeMode::AbsLocal => t.time_abs_local,
+                TimeMode::RelFirst => t.time_rel_first,
+                TimeMode::RelPrev => t.time_rel_prev,
+            };
+            egui::Window::new(format!("⚙ {}", t.settings))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    let s = &mut self.settings;
+                    egui::Grid::new("settings-grid")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            // 语言
+                            ui.label(t.settings_language);
+                            egui::ComboBox::from_id_salt("set-lang")
+                                .selected_text(match s.lang {
+                                    Lang::Zh => "中文",
+                                    Lang::En => "English",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut s.lang, Lang::Zh, "中文");
+                                    ui.selectable_value(&mut s.lang, Lang::En, "English");
+                                });
+                            ui.end_row();
+                            // 主题
+                            ui.label(t.settings_theme);
+                            ui.horizontal(|ui| {
+                                if ui.radio(s.dark, t.theme_dark).clicked() {
+                                    s.dark = true;
+                                    theme_changed = true;
+                                }
+                                if ui.radio(!s.dark, t.theme_light).clicked() {
+                                    s.dark = false;
+                                    theme_changed = true;
+                                }
+                            });
+                            ui.end_row();
+                            // 默认归档目录
+                            ui.label(t.settings_archive_dir);
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut s.archive_dir)
+                                        .desired_width(280.0),
+                                );
+                                if ui.button(t.settings_browse).clicked() {
+                                    pick_dir = true;
+                                }
+                            });
+                            ui.end_row();
+                            // 保留上限
+                            ui.label(t.settings_retain_rows);
+                            ui.add(
+                                egui::DragValue::new(&mut s.retain_max_rows)
+                                    .speed(10_000)
+                                    .range(1_000..=usize::MAX),
+                            );
+                            ui.end_row();
+                            ui.label(t.settings_retain_mb);
+                            ui.add(
+                                egui::DragValue::new(&mut s.retain_max_mb)
+                                    .speed(16)
+                                    .range(16..=u64::MAX),
+                            );
+                            ui.end_row();
+                        });
+
+                    ui.separator();
+                    ui.label(RichText::new(t.settings_defaults_note).weak());
+                    egui::Grid::new("settings-defaults-grid")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            let s = &mut self.settings;
+                            // 默认时间模式
+                            ui.label(t.settings_default_time);
+                            egui::ComboBox::from_id_salt("set-time")
+                                .selected_text(tm_label(s.default_time_mode))
+                                .show_ui(ui, |ui| {
+                                    for m in [
+                                        TimeMode::AbsOriginal,
+                                        TimeMode::AbsLocal,
+                                        TimeMode::RelFirst,
+                                        TimeMode::RelPrev,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut s.default_time_mode,
+                                            m,
+                                            tm_label(m),
+                                        );
+                                    }
+                                });
+                            ui.end_row();
+                            // 默认密度
+                            ui.label(t.settings_default_density);
+                            ui.horizontal(|ui| {
+                                ui.radio_value(&mut s.default_compact, true, t.density_compact);
+                                ui.radio_value(&mut s.default_compact, false, t.density_detail);
+                            });
+                            ui.end_row();
+                            // 默认换行
+                            ui.label(t.settings_default_wrap);
+                            ui.checkbox(&mut s.default_wrap, t.wrap_lines);
+                            ui.end_row();
+                            // 默认错误率阈值
+                            ui.label(t.dash_threshold);
+                            ui.add(
+                                egui::DragValue::new(&mut s.dash_threshold)
+                                    .speed(0.5)
+                                    .range(0.0..=100.0),
+                            );
+                            ui.end_row();
+                            // 默认显示列
+                            ui.label(t.settings_default_cols);
+                            ui.vertical(|ui| {
+                                let c = &mut s.default_cols;
+                                ui.checkbox(&mut c.time, t.col_time);
+                                ui.checkbox(&mut c.host, t.col_host);
+                                ui.checkbox(&mut c.app, t.col_app);
+                                ui.checkbox(&mut c.pid, t.col_pid);
+                                ui.checkbox(&mut c.level, t.col_level);
+                                ui.checkbox(&mut c.tag, t.col_tag);
+                                ui.checkbox(&mut c.source, t.col_source);
+                            });
+                            ui.end_row();
+                        });
+                });
+            if theme_changed {
+                self.visuals_applied = false;
+            }
+            if pick_dir {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    self.settings.archive_dir = dir.display().to_string();
+                }
+            }
+            self.settings_open = open;
         }
     }
 
@@ -756,5 +929,45 @@ impl eframe::App for LogViewerApp {
             self.last_session_save = std::time::Instant::now();
             self.last_tab_count = self.tabs.len();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 旧版 session.json（无设置页字段）应能加载，新字段回退默认值。
+    #[test]
+    fn settings_legacy_json_loads_with_defaults() {
+        let legacy = r#"{"lang":"En","dark":false,"saved_filters":[]}"#;
+        let s: Settings = serde_json::from_str(legacy).unwrap();
+        assert_eq!(s.lang, Lang::En);
+        assert!(!s.dark);
+        // 新字段回退到 Default
+        let def = Settings::default();
+        assert_eq!(s.archive_dir, def.archive_dir);
+        assert_eq!(s.default_time_mode, def.default_time_mode);
+        assert_eq!(s.default_compact, def.default_compact);
+        assert_eq!(s.retain_max_rows, def.retain_max_rows);
+        assert_eq!(s.retain_max_mb, def.retain_max_mb);
+    }
+
+    /// 保留上限折算：行数透传，MB → 字节，且默认值匹配核心库默认。
+    #[test]
+    fn retain_limits_conversion_matches_core_default() {
+        let s = Settings::default();
+        let lim = s.retain_limits();
+        let core_default = RetainLimits::default();
+        assert_eq!(lim.max_rows, core_default.max_rows);
+        assert_eq!(lim.max_bytes, core_default.max_bytes);
+
+        let custom = Settings {
+            retain_max_rows: 5_000,
+            retain_max_mb: 2,
+            ..Settings::default()
+        };
+        let lim = custom.retain_limits();
+        assert_eq!(lim.max_rows, 5_000);
+        assert_eq!(lim.max_bytes, 2 << 20);
     }
 }

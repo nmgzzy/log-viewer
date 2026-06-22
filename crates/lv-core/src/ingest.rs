@@ -11,9 +11,22 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::archive::{ArchiveConfig, ArchiveWriter};
+use crate::model::ParsedLine;
 use crate::parse::{parse_auto, ParserCtx};
 use crate::source::{RawLine, SourceEvent};
 use crate::store::LogStore;
+
+/// `IngestStats.errors` 保留的最近错误条数上限（防止长跑无界增长）。
+const MAX_ERRORS: usize = 200;
+
+/// 追加一条错误信息，超过上限时丢弃最旧（环形）。
+fn push_error(stats: &IngestStats, msg: String) {
+    let mut v = stats.errors.lock().unwrap();
+    if v.len() >= MAX_ERRORS {
+        v.remove(0);
+    }
+    v.push(msg);
+}
 
 pub struct IngestOpts {
     pub source_id: u16,
@@ -97,11 +110,7 @@ fn run(
         match ArchiveWriter::new(cfg.clone()) {
             Ok(w) => Some(w),
             Err(e) => {
-                stats
-                    .errors
-                    .lock()
-                    .unwrap()
-                    .push(format!("归档初始化失败: {e}"));
+                push_error(&stats, format!("归档初始化失败: {e}"));
                 None
             }
         }
@@ -117,7 +126,7 @@ fn run(
                 stats.load_done.store(true, Ordering::Relaxed);
             }
             Ok(SourceEvent::Error(e)) => {
-                stats.errors.lock().unwrap().push(e);
+                push_error(&stats, e);
             }
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(a) = archive.as_mut() {
@@ -140,16 +149,26 @@ fn ingest_batch(
     archive: &mut Option<ArchiveWriter>,
 ) {
     let paused = opts.paused.load(Ordering::Relaxed);
+    // 暂停且无归档：无事可做（不解析、不入库）
+    if paused && archive.is_none() {
+        stats
+            .skipped_paused
+            .fetch_add(lines.len() as u64, Ordering::Relaxed);
+        return;
+    }
+    // 解析一次，归档与入库共用（此前两条路径各 parse_auto 一次）。
+    // peer 回退主机名单独拥有所有权，供两处按引用复用。
+    let parsed: Vec<ParsedLine> = lines.iter().map(|l| parse_auto(&l.text, &opts.ctx)).collect();
+    let peer_hosts: Vec<Option<String>> =
+        lines.iter().map(|l| l.peer.map(|ip| ip.to_string())).collect();
+
     // 归档独立于暂停：磁盘上留全的
     if let Some(a) = archive.as_mut() {
-        for line in lines {
-            let p = parse_auto(&line.text, &opts.ctx);
-            let peer_str;
+        for ((line, p), peer) in lines.iter().zip(&parsed).zip(&peer_hosts) {
             let host: &str = if !p.host.is_empty() {
                 p.host
-            } else if let Some(ip) = line.peer {
-                peer_str = ip.to_string();
-                &peer_str
+            } else if let Some(ps) = peer {
+                ps.as_str()
             } else {
                 ""
             };
@@ -169,13 +188,10 @@ fn ingest_batch(
         .meta_at(s.len().saturating_sub(1))
         .map(|m| m.ts)
         .unwrap_or(0);
-    for line in lines {
-        let mut p = parse_auto(&line.text, &opts.ctx);
-        let peer_str;
+    for ((line, mut p), peer) in lines.iter().zip(parsed).zip(&peer_hosts) {
         if p.parsed && p.host.is_empty() {
-            if let Some(ip) = line.peer {
-                peer_str = ip.to_string();
-                p.host = &peer_str;
+            if let Some(ps) = peer {
+                p.host = ps.as_str();
             }
         }
         // 无内容时间戳的回退：文件按邻行保持顺序，网络按接收时间
@@ -333,6 +349,19 @@ mod tests {
         assert_eq!(h.stats.skipped_paused.load(Ordering::Relaxed), 1);
         let content = std::fs::read_to_string(dir.path().join("udp-all.log")).unwrap();
         assert_eq!(content, "paused line\n");
+    }
+
+    #[test]
+    fn errors_vec_is_capped() {
+        let stats = IngestStats::default();
+        for i in 0..(MAX_ERRORS + 50) {
+            push_error(&stats, format!("err {i}"));
+        }
+        let v = stats.errors.lock().unwrap();
+        // 长度封顶，且保留的是最近的错误（最旧被丢弃）
+        assert_eq!(v.len(), MAX_ERRORS);
+        assert_eq!(v.last().unwrap(), &format!("err {}", MAX_ERRORS + 49));
+        assert_eq!(v.first().unwrap(), &format!("err {}", 50));
     }
 
     #[test]

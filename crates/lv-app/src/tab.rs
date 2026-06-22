@@ -35,9 +35,7 @@ pub enum TabKind {
         port: u16,
         archive: Option<ArchiveConfig>,
     },
-    Merged {
-        members: Vec<String>,
-    },
+    Merged,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -650,17 +648,21 @@ impl Tab {
     // ---------- 表格 ----------
 
     fn table(&mut self, ui: &mut egui::Ui, t: &Texts, dark: bool) {
-        let store = self.store.lock().unwrap();
+        // 锁粒度：不再整帧持锁渲染。view.seqs 由 Tab 独占（无需锁），首行时间戳
+        // 用一次短锁取出，逐行渲染时各自短暂加锁，让 ingest 写入可在行间穿插。
         let total = self.view.len();
         let row_h = if self.compact { 18.0 } else { 24.0 };
         let local_off = local_tz_offset_min();
-        let first_ts = self
-            .view
-            .seqs
-            .first()
-            .and_then(|q| store.meta_by_seq(*q))
-            .map(|m| m.ts)
-            .unwrap_or(0);
+        let first_ts = {
+            let store = self.store.lock().unwrap();
+            self.view
+                .seqs
+                .first()
+                .and_then(|q| store.meta_by_seq(*q))
+                .map(|m| m.ts)
+                .unwrap_or(0)
+        };
+        let store_arc = self.store.clone();
 
         // 滚轮上滚 → 取消跟随
         if ui.rect_contains_pointer(ui.available_rect_before_wrap())
@@ -767,6 +769,8 @@ impl Tab {
             body.rows(row_h, total, |mut row| {
                 let vi = row.index();
                 let seq = view[vi];
+                // 每行短锁：仅覆盖该行的 store 读取与绘制，行间释放给 ingest
+                let store = store_arc.lock().unwrap();
                 let Some(m) = store.meta_by_seq(seq).copied() else {
                     row.col(|_| {});
                     return;
@@ -912,7 +916,6 @@ impl Tab {
                 }
             });
         });
-        drop(store);
 
         if let Some(vi) = clicked_row {
             self.selected = Some(vi);

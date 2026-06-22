@@ -97,6 +97,10 @@ fn run(
             }
         }
     }
+    // 退出前 flush 尾批：高速率下 stop 翻转时 batch 可能未满，避免静默丢失
+    if !batch.is_empty() {
+        send_batch(&tx, &mut batch, &dropped);
+    }
 }
 
 fn send_batch(tx: &Sender<SourceEvent>, batch: &mut Vec<RawLine>, dropped: &AtomicU64) {
